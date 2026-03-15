@@ -326,7 +326,7 @@
               <div class="mini-stat"><div class="mini-val" style="color:#f59e0b" id="r-sp">0</div><div class="mini-lbl">Spam</div></div>
             </div>
             <div class="ai-box" id="ai-box">
-              <div class="ai-title">🤖 AI Analysis (HuggingFace)</div>
+              <div class="ai-title">🤖 AI Analysis (API Validation)</div>
               <div class="ai-text" id="ai-text"></div>
               <div class="ai-tags" id="ai-tags"></div>
             </div>
@@ -651,7 +651,7 @@ async function doVerify() {
     document.getElementById('r-tot').textContent = data.totalReports ?? 0;
     document.getElementById('r-sc').textContent  = data.scamCount    ?? 0;
     document.getElementById('r-sp').textContent  = data.spamCount    ?? 0;
-    const ai = data.aiAnalysis;
+    const ai = data.aiAnalysis || {};
     if (ai) {
       document.getElementById('ai-box').classList.add('show');
       document.getElementById('ai-text').textContent = ai.summary ?? '';
