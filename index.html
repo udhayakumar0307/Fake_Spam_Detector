@@ -454,7 +454,7 @@
 <!-- ═══ SCRIPT ════════════════════════════════════════════════ -->
 <script>
 /* ── Config ────────────────────────────────────────────────── */
-const API = "http://35.154.39.175";
+const API = "http://35.154.39.175:5000";
 
 /* ── State ─────────────────────────────────────────────────── */
 let authMode     = 'login';
@@ -622,12 +622,7 @@ async function doVerify() {
   const txt = document.getElementById('verify-btn-txt');
   btn.disabled = true; txt.innerHTML = '<span class="spinner"></span>';
   try {
-  const res = await fetch(`${API}/api/lookup/${encodeURIComponent(val)}`, {
-  headers: {
-    ...authHeaders(),
-    "ngrok-skip-browser-warning": "true"
-  }
-});
+  const res = await fetch(`${API}/api/lookup/${encodeURIComponent(val)}`, {headers: authHeaders()});
 
   const text = await res.text();
   let data;
