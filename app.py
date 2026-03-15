@@ -1,5 +1,5 @@
 """
-FakeShield API v3.2.1 - Fixed Numverify API Integration
+FakeShield API v3.2 - Inverted Risk Score Edition
 ──────────────────────────────────────────────────────────────────
 Backend: Flask + AWS DynamoDB + AWS SNS + Numverify + AbstractAPI + JWT Auth
 ──────────────────────────────────────────────────────────────────
@@ -8,11 +8,6 @@ Risk Score Scale (INVERTED - Higher is Better):
   70-40   = MEDIUM RISK (Possibly Suspicious)
   40-10   = DANGER (High Risk)
   10-0    = EXTREME DANGER (Very High Risk)
-──────────────────────────────────────────────────────────────────
-IMPORTANT: Numverify Free Tier
-  - Use HTTP (not HTTPS): http://apilayer.net/api/validate
-  - If you have paid plan, use: https://apilayer.net/api/validate
-  - Free tier has rate limits (250 requests/month)
 ──────────────────────────────────────────────────────────────────
 Required .env variables:
   AWS_ACCESS_KEY_ID=
@@ -56,9 +51,7 @@ NUMVERIFY_API_KEY   = os.getenv("NUMVERIFY_API_KEY", "64b1ebe2c88531cfdef4a71c31
 ABSTRACTAPI_EMAIL_KEY = os.getenv("ABSTRACTAPI_EMAIL_KEY", "0e6bb95788544355ad0c2366cc44ef77")
 JWT_SECRET          = os.getenv("JWT_SECRET", "changeme_secret")
 
-# Numverify: Use HTTP for free tier, HTTPS for paid plans
-NUMVERIFY_USE_HTTPS = os.getenv("NUMVERIFY_HTTPS", "false").lower() == "true"
-NUMVERIFY_BASE      = f"{'https' if NUMVERIFY_USE_HTTPS else 'http'}://apilayer.net/api/validate"
+NUMVERIFY_BASE      = "http://apilayer.net/api/validate"  # HTTP only for free tier
 ABSTRACTAPI_BASE    = "https://emailvalidation.abstractapi.com/v1/"
 
 
@@ -223,43 +216,15 @@ def detect_id_type(v: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-#  NUMVERIFY API (WITH BETTER ERROR HANDLING)
+#  NUMVERIFY API
 # ════════════════════════════════════════════════════════════════
 def numverify_validate(phone: str) -> dict:
-    """
-    Validate phone number using Numverify API
-    Returns basic validation on API failure (graceful degradation)
-    """
     try:
         clean_phone = re.sub(r"[\s\-().+]", "", phone)
-        
-        params = {
-            "access_key": NUMVERIFY_API_KEY,
-            "number": clean_phone,
-            "format": 1
-        }
-        
-        print(f"[Numverify] Calling {NUMVERIFY_BASE} with number: {clean_phone}")
-        response = requests.get(NUMVERIFY_BASE, params=params, timeout=15)
-        
-        # Debug response
-        print(f"[Numverify] Status: {response.status_code}")
-        
-        # Handle 403 Forbidden specifically
-        if response.status_code == 403:
-            print("[Numverify] 403 Forbidden - API key may be invalid or free tier HTTPS restriction")
-            print("[Numverify] Tip: Free tier requires HTTP, not HTTPS")
-            # Return fallback validation
-            return fallback_phone_validation(clean_phone)
-        
+        params = {"access_key": NUMVERIFY_API_KEY, "number": clean_phone, "format": 1}
+        response = requests.get(NUMVERIFY_BASE, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
-        # Check if API returned an error
-        if "error" in data:
-            error_info = data["error"]
-            print(f"[Numverify] API Error: {error_info}")
-            return fallback_phone_validation(clean_phone)
         
         if data.get("valid"):
             return {
@@ -272,82 +237,22 @@ def numverify_validate(phone: str) -> dict:
                 "country_name": data.get("country_name", ""),
                 "location": data.get("location", ""),
                 "carrier": data.get("carrier", ""),
-                "line_type": data.get("line_type", ""),
-                "source": "numverify"
+                "line_type": data.get("line_type", "")
             }
         else:
-            return {"valid": False, "error": "Invalid phone number", "source": "numverify"}
-            
-    except requests.exceptions.Timeout:
-        print(f"[Numverify] Timeout - using fallback validation")
-        return fallback_phone_validation(clean_phone)
-    except requests.exceptions.RequestException as e:
-        print(f"[Numverify] Request Error: {e} - using fallback validation")
-        return fallback_phone_validation(clean_phone)
+            return {"valid": False, "error": data.get("error", {}).get("info", "Invalid phone number")}
     except Exception as e:
-        print(f"[Numverify] Unexpected Error: {e} - using fallback validation")
-        return fallback_phone_validation(clean_phone)
-
-
-def fallback_phone_validation(clean_phone: str) -> dict:
-    """
-    Fallback phone validation when Numverify API fails
-    Uses basic pattern matching for common formats
-    """
-    # Remove all non-digits
-    digits_only = re.sub(r"\D", "", clean_phone)
-    
-    # Basic validation: 7-15 digits
-    if 7 <= len(digits_only) <= 15:
-        # Try to detect country from prefix
-        country = "Unknown"
-        if digits_only.startswith("1"):
-            country = "United States/Canada"
-        elif digits_only.startswith("44"):
-            country = "United Kingdom"
-        elif digits_only.startswith("91"):
-            country = "India"
-        elif digits_only.startswith("86"):
-            country = "China"
-        elif digits_only.startswith("81"):
-            country = "Japan"
-        elif digits_only.startswith("61"):
-            country = "Australia"
-        
-        return {
-            "valid": True,
-            "number": digits_only,
-            "local_format": clean_phone,
-            "international_format": f"+{digits_only}",
-            "country_name": country,
-            "carrier": "Unknown (API unavailable)",
-            "line_type": "Unknown",
-            "source": "fallback",
-            "note": "Numverify API unavailable - using basic validation"
-        }
-    else:
-        return {
-            "valid": False,
-            "error": "Invalid phone number format",
-            "source": "fallback"
-        }
+        print(f"[Numverify Error] {e}")
+        return {"valid": False, "error": f"API Error: {str(e)}"}
 
 
 # ════════════════════════════════════════════════════════════════
 #  ABSTRACTAPI EMAIL VALIDATION
 # ════════════════════════════════════════════════════════════════
 def abstractapi_validate_email(email: str) -> dict:
-    """Validate and get reputation for email using AbstractAPI"""
     try:
         params = {"api_key": ABSTRACTAPI_EMAIL_KEY, "email": email}
-        response = requests.get(ABSTRACTAPI_BASE, params=params, timeout=15)
-        
-        print(f"[AbstractAPI] Status: {response.status_code}")
-        
-        if response.status_code == 403:
-            print("[AbstractAPI] 403 Forbidden - API key may be invalid")
-            return fallback_email_validation(email)
-        
+        response = requests.get(ABSTRACTAPI_BASE, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         
@@ -362,41 +267,11 @@ def abstractapi_validate_email(email: str) -> dict:
             "is_mx_found": data.get("is_mx_found", {}).get("value", False),
             "is_smtp_valid": data.get("is_smtp_valid", {}).get("value", False),
             "domain": data.get("domain", ""),
-            "smtp_provider": data.get("smtp_provider", ""),
-            "source": "abstractapi"
+            "smtp_provider": data.get("smtp_provider", "")
         }
     except Exception as e:
-        print(f"[AbstractAPI] Error: {e} - using fallback")
-        return fallback_email_validation(email)
-
-
-def fallback_email_validation(email: str) -> dict:
-    """Fallback email validation using regex"""
-    # Basic email regex
-    email_pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
-    valid = bool(re.match(email_pattern, email))
-    
-    # Check for common disposable domains
-    disposable_domains = ["tempmail.com", "guerrillamail.com", "10minutemail.com", 
-                         "throwaway.email", "mailinator.com"]
-    domain = email.split("@")[1] if "@" in email else ""
-    is_disposable = domain.lower() in disposable_domains
-    
-    # Check for free providers
-    free_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com"]
-    is_free = domain.lower() in free_domains
-    
-    return {
-        "valid": valid,
-        "deliverable": "UNKNOWN",
-        "quality_score": 0.5 if valid else 0,
-        "is_disposable": is_disposable,
-        "is_free_email": is_free,
-        "is_role_email": email.startswith(("admin@", "info@", "support@", "contact@")),
-        "domain": domain,
-        "source": "fallback",
-        "note": "AbstractAPI unavailable - using basic validation"
-    }
+        print(f"[AbstractAPI Error] {e}")
+        return {"valid": False, "error": f"API Error: {str(e)}"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -446,10 +321,6 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
         email_result = abstractapi_validate_email(identifier)
         api_data = email_result
         
-        # Check if using fallback
-        if email_result.get("source") == "fallback":
-            flags.append({"label": "API Unavailable (Basic Check)", "level": "warning"})
-        
         if not email_result.get("valid", False):
             flags.append({"label": "Invalid Email Format", "level": "danger"})
         else:
@@ -478,10 +349,6 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
         phone_result = numverify_validate(identifier)
         api_data = phone_result
         
-        # Check if using fallback
-        if phone_result.get("source") == "fallback":
-            flags.append({"label": "API Unavailable (Basic Check)", "level": "warning"})
-        
         if not phone_result.get("valid", False):
             flags.append({"label": "Invalid Phone Number", "level": "danger"})
         else:
@@ -490,10 +357,10 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
             line_type = phone_result.get("line_type", "Unknown")
             
             flags.append({"label": f"Valid {country} Number", "level": "safe"})
-            if carrier and carrier != "Unknown" and "unavailable" not in carrier.lower():
+            if carrier and carrier != "Unknown":
                 flags.append({"label": f"Carrier: {carrier}", "level": "info"})
             
-            if line_type and line_type != "Unknown":
+            if line_type:
                 if line_type.lower() in ["mobile", "cell"]:
                     flags.append({"label": "Mobile Number", "level": "safe"})
                 elif line_type.lower() in ["landline", "fixed"]:
@@ -529,7 +396,7 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
         "flags": flags[:8],
         "identifierType": id_type,
         "apiData": api_data,
-        "analysisSource": api_data.get("source", "unknown")
+        "analysisSource": "Numverify" if id_type == "phone" else ("AbstractAPI" if id_type == "email" else "None")
     }
 
 
@@ -553,7 +420,6 @@ def db_log_search(identifier: str, trust_score: float, user_email: str = None, a
         }
         
         if api_result:
-            item["api_source"] = api_result.get("source", "unknown")
             if id_type == "email":
                 item["email_quality"] = api_result.get("quality_score", 0)
                 item["deliverable"] = api_result.get("deliverable", "UNKNOWN")
@@ -695,10 +561,9 @@ def me():
 def home():
     return jsonify({
         "status": "running",
-        "service": "FakeShield API v3.2.1",
+        "service": "FakeShield API v3.2",
         "riskScale": "100-70=SAFE | 70-40=MEDIUM | 40-10=DANGER | 10-0=EXTREME",
         "numverify": bool(NUMVERIFY_API_KEY),
-        "numverify_protocol": "HTTPS" if NUMVERIFY_USE_HTTPS else "HTTP (free tier)",
         "abstractapi": bool(ABSTRACTAPI_EMAIL_KEY),
         "sns": bool(SNS_TOPIC_ARN)
     })
@@ -856,18 +721,15 @@ if __name__ == "__main__":
     debug = os.getenv("DEBUG", "False") == "True"
     
     print(f"\n{'═'*70}")
-    print(f"  FakeShield API v3.2.1 - Inverted Risk Score + Fallback Validation")
+    print(f"  FakeShield API v3.2 - Inverted Risk Score Edition")
     print(f"  {'─'*68}")
     print(f"  Risk Scale  : 100-70=SAFE | 70-40=MEDIUM | 40-10=DANGER | 10-0=EXTREME")
     print(f"  Region      : {AWS_REGION}")
     print(f"  DynamoDB    : {REPORTS_TABLE} / {USERS_TABLE} / {SEARCHES_TABLE}")
     print(f"  SNS         : {SNS_TOPIC_ARN or '✗ not set'}")
-    print(f"  Numverify   : {'✓' if NUMVERIFY_API_KEY else '✗ not set'} ({NUMVERIFY_BASE})")
+    print(f"  Numverify   : {'✓' if NUMVERIFY_API_KEY else '✗ not set'}")
     print(f"  AbstractAPI : {'✓' if ABSTRACTAPI_EMAIL_KEY else '✗ not set'}")
     print(f"  JWT         : {'⚠ default!' if JWT_SECRET=='changeme_secret' else '✓'}")
-    print(f"  {'─'*68}")
-    print(f"  NOTE: Free Numverify tier requires HTTP (not HTTPS)")
-    print(f"        Set NUMVERIFY_HTTPS=true in .env if you have paid plan")
     print(f"{'═'*70}\n")
     
     app.run(host="0.0.0.0", port=port, debug=debug)
