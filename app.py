@@ -41,8 +41,8 @@ SNS_TOPIC_ARN  = os.getenv("SNS_TOPIC_ARN", "")
 HF_API_TOKEN   = os.getenv("HF_API_TOKEN", "")
 JWT_SECRET     = os.getenv("JWT_SECRET", "changeme_secret")
 HF_BASE        = "https://api-inference.huggingface.co/models"
-SPAM_MODEL     = "mrm8488/bert-tiny-finetuned-sms-spam-detection"
-ZEROSHOT_MODEL = "facebook/bart-large-mnli"
+SPAM_MODEL     = "cardiffnlp/twitter-roberta-base-offensive"
+ZEROSHOT_MODEL = "MoritzLaurer/deberta-v3-large-zeroshot-v2.0"
 
 
 # ════════════════════════════════════════════════════════════════
