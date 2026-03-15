@@ -246,7 +246,9 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
     total, risk = stats.get("totalReports",0), stats.get("riskScore",0)
     id_type = detect_id_type(identifier)
     ctx = f"This {id_type} {identifier} was reported {scam}× scam, {spam}× spam, {genuine}× genuine out of {total} reports."
-    sr  = hf_spam(ctx)
+    sr = hf_spam(
+    f"Message from {identifier}. Could this be phishing or spam?"
+    )
     lbl, sc = sr.get("label","UNKNOWN").upper(), sr.get("score",0.0)
     zs  = hf_zero_shot(ctx, ["phishing scam","financial fraud","spam marketing",
                               "legitimate business","identity theft","harmless contact"])
@@ -406,7 +408,8 @@ def lookup(identifier):
         if request.args.get("ai","true").lower() != "false":
             s["aiAnalysis"] = build_ai_analysis(identifier, s)
         if s["totalReports"] == 0:
-            s["message"] = "No community reports; AI analysis only."
+            s["riskScore"] = round(sr.get("score",0)*100)
+            s["message"] = "No community reports; AI heuristic analysis."
         return jsonify(s), 200
     except Exception as e:
         return jsonify({"error":str(e)}), 500
