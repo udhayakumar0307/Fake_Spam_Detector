@@ -29,12 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-)
+CORS(app, origins="*", supports_credentials=True)
 
 # ════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -211,14 +206,27 @@ def detect_id_type(v: str) -> str:
 
 def hf_spam(text: str) -> dict:
     try:
-        r = requests.post(f"{HF_BASE}/{SPAM_MODEL}", headers=_hf_hdr(),
-                          json={"inputs": text, "options": {"wait_for_model": True}}, timeout=15)
+        r = requests.post(
+            f"{HF_BASE}/{SPAM_MODEL}",
+            headers=_hf_hdr(),
+            json={"inputs": text, "options": {"wait_for_model": True}},
+            timeout=15
+        )
+
         r.raise_for_status()
-        items = r.json()
-        items = items[0] if isinstance(items[0], list) else items
-        return max(items, key=lambda x: x.get("score", 0))
+        data = r.json()
+
+        # Handle nested list response
+        if isinstance(data, list):
+            if len(data) > 0 and isinstance(data[0], list):
+                data = data[0]
+
+        if isinstance(data, list) and len(data) > 0:
+            return max(data, key=lambda x: x.get("score", 0))
+
     except Exception as e:
-        print(f"[HF spam] {e}")
+        print("[HF spam ERROR]", e)
+
     return {"label": "UNKNOWN", "score": 0.0}
 
 def hf_zero_shot(text: str, labels: list) -> dict:
