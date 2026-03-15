@@ -454,7 +454,7 @@
 <!-- ═══ SCRIPT ════════════════════════════════════════════════ -->
 <script>
 /* ── Config ────────────────────────────────────────────────── */
-const API = "https://jagged-prethyroid-altagracia.ngrok-free.dev";
+const API = "http://35.154.39.175:5000";
 
 /* ── State ─────────────────────────────────────────────────── */
 let authMode     = 'login';
@@ -622,8 +622,18 @@ async function doVerify() {
   const txt = document.getElementById('verify-btn-txt');
   btn.disabled = true; txt.innerHTML = '<span class="spinner"></span>';
   try {
-    const res  = await fetch(`${API}/api/lookup/${encodeURIComponent(val)}`, {headers: authHeaders()});
-    const data = await res.json();
+  const res = await fetch(`${API}/api/lookup/${encodeURIComponent(val)}`, {headers: authHeaders()});
+
+  const text = await res.text();
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch(err) {
+    console.error("Invalid backend response:", text);
+    showToast("Backend returned invalid response", "error");
+    return;
+  }
     const rb   = document.getElementById('result-box');
     rb.classList.add('show');
     document.getElementById('r-id-bar').textContent = val;
