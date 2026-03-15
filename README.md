@@ -46,7 +46,7 @@ Access the deployed project here:
 5. The validation data is stored securely in **AWS DynamoDB** for record keeping.
 
 ## Author
-**Vaishnavi Kannan**
+**Udhayakumar P**
 
 ## License
 This project is created for educational and cybersecurity research purposes.
