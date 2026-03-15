@@ -209,25 +209,29 @@ def hf_spam(text: str) -> dict:
         r = requests.post(
             f"{HF_BASE}/{SPAM_MODEL}",
             headers=_hf_hdr(),
-            json={"inputs": text, "options": {"wait_for_model": True}},
-            timeout=15
+            json={"inputs": text},
+            timeout=20
         )
 
         r.raise_for_status()
         data = r.json()
 
-        # Handle nested list response
+        # HuggingFace sometimes returns nested lists
         if isinstance(data, list):
             if len(data) > 0 and isinstance(data[0], list):
                 data = data[0]
 
         if isinstance(data, list) and len(data) > 0:
-            return max(data, key=lambda x: x.get("score", 0))
+            best = max(data, key=lambda x: x.get("score",0))
+            return {
+                "label": best.get("label","UNKNOWN"),
+                "score": best.get("score",0)
+            }
 
     except Exception as e:
-        print("[HF spam ERROR]", e)
+        print("HF ERROR:", e)
 
-    return {"label": "UNKNOWN", "score": 0.0}
+    return {"label":"UNKNOWN","score":0}
 
 def hf_zero_shot(text: str, labels: list) -> dict:
     try:
@@ -242,33 +246,86 @@ def hf_zero_shot(text: str, labels: list) -> dict:
     return {}
 
 def build_ai_analysis(identifier: str, stats: dict) -> dict:
-    scam, spam, genuine = stats.get("scamCount",0), stats.get("spamCount",0), stats.get("genuineCount",0)
-    total, risk = stats.get("totalReports",0), stats.get("riskScore",0)
+
+    scam     = stats.get("scamCount",0)
+    spam     = stats.get("spamCount",0)
+    genuine  = stats.get("genuineCount",0)
+    total    = stats.get("totalReports",0)
+    risk     = stats.get("riskScore",0)
+
     id_type = detect_id_type(identifier)
-    ctx = f"This {id_type} {identifier} was reported {scam}× scam, {spam}× spam, {genuine}× genuine out of {total} reports."
-    sr = hf_spam(
-    f"Message from {identifier}. Could this be phishing or spam?"
+
+    # Better AI context
+    ctx = f"""
+    A communication from {identifier}.
+    Could this be a phishing scam, spam marketing, or legitimate contact?
+    """
+
+    # HuggingFace spam classifier
+    sr  = hf_spam(ctx)
+    lbl = sr.get("label","UNKNOWN").upper()
+    sc  = sr.get("score",0.0)
+
+    # Zero-shot classification
+    zs = hf_zero_shot(
+        ctx,
+        [
+            "phishing scam",
+            "financial fraud",
+            "spam marketing",
+            "legitimate business",
+            "identity theft",
+            "harmless contact"
+        ]
     )
-    lbl, sc = sr.get("label","UNKNOWN").upper(), sr.get("score",0.0)
-    zs  = hf_zero_shot(ctx, ["phishing scam","financial fraud","spam marketing",
-                              "legitimate business","identity theft","harmless contact"])
+
     flags = []
-    if lbl == "SPAM":  flags.append({"label":"AI: Spam Pattern","level":"warning"})
-    elif lbl == "HAM" and risk < 20: flags.append({"label":"AI: Looks Legitimate","level":"safe"})
+
+    # Spam classifier flag
+    if lbl == "SPAM":
+        flags.append({"label":"AI: Spam Pattern","level":"warning"})
+    elif lbl == "HAM" and risk < 20:
+        flags.append({"label":"AI: Looks Legitimate","level":"safe"})
+
+    # Zero-shot categories
     for l, s in sorted(zs.items(), key=lambda x:-x[1])[:3]:
+
         if s > 0.2:
-            lvl = "safe" if ("legitimate" in l or "harmless" in l) else ("danger" if s>0.4 else "warning")
-            flags.append({"label":f"{l.title()} ({s:.0%})","level":lvl})
-    if scam:    flags.append({"label":f"{scam} Scam Report(s)","level":"danger"})
-    if spam:    flags.append({"label":f"{spam} Spam Report(s)","level":"warning"})
-    if genuine: flags.append({"label":f"{genuine} Genuine Report(s)","level":"safe"})
-    top = max(zs.items(), key=lambda x:x[1], default=("unknown",0)) if zs else ("unknown",0)
+
+            lvl = "safe" if ("legitimate" in l or "harmless" in l) \
+                  else ("danger" if s > 0.4 else "warning")
+
+            flags.append({
+                "label":f"{l.title()} ({s:.0%})",
+                "level":lvl
+            })
+
+    # Community reports
+    if scam:
+        flags.append({"label":f"{scam} Scam Report(s)","level":"danger"})
+    if spam:
+        flags.append({"label":f"{spam} Spam Report(s)","level":"warning"})
+    if genuine:
+        flags.append({"label":f"{genuine} Genuine Report(s)","level":"safe"})
+
+    # Top AI category
+    top = max(zs.items(), key=lambda x:x[1], default=("unknown",0))
+
+    # Risk level
     tone = "HIGH RISK" if risk>=70 else ("MEDIUM RISK" if risk>=30 else "LOW RISK")
+
+    # HF note
     hf_note = f"HF: {lbl} ({sc:.0%})." if lbl!="UNKNOWN" else "HF model unavailable."
-    return {"verdict":tone,
-            "summary":f"{tone}. {hf_note} Top: {top[0].title()} ({top[1]:.0%}). Reports: {total}.",
-            "flags":flags[:6], "hfLabel":lbl, "hfConfidence":round(sc,4),
-            "topCategory":top[0], "identifierType":id_type}
+
+    return {
+        "verdict":tone,
+        "summary":f"{tone}. {hf_note} Top: {top[0].title()} ({top[1]:.0%}). Reports: {total}.",
+        "flags":flags[:6],
+        "hfLabel":lbl,
+        "hfConfidence":round(sc,4),
+        "topCategory":top[0],
+        "identifierType":id_type
+    }
 
 
 # ════════════════════════════════════════════════════════════════
@@ -409,7 +466,7 @@ def lookup(identifier):
             s["aiAnalysis"] = build_ai_analysis(identifier, s)
         if s["totalReports"] == 0:
             s["riskScore"] = round(sr.get("score",0)*100)
-            s["message"] = "No community reports; AI heuristic analysis."
+            s["message"] = "AI heuristic analysis (no community reports)"
         return jsonify(s), 200
     except Exception as e:
         return jsonify({"error":str(e)}), 500
