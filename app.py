@@ -1,13 +1,7 @@
 """
-FakeShield API v3.2 - Inverted Risk Score Edition
+FakeShield API v3.2
 ──────────────────────────────────────────────────────────────────
-Backend: Flask + AWS DynamoDB + AWS SNS + Numverify + AbstractAPI + JWT Auth
-──────────────────────────────────────────────────────────────────
-Risk Score Scale (INVERTED - Higher is Better):
-  100-70  = SAFE (Good/Trusted)
-  70-40   = MEDIUM RISK (Possibly Suspicious)
-  40-10   = DANGER (High Risk)
-  10-0    = EXTREME DANGER (Very High Risk)
+Backend: Flask + AWS DynamoDB + AWS SNS + MSG91 + ZeroBounce + Claude AI + JWT Auth
 ──────────────────────────────────────────────────────────────────
 Required .env variables:
   AWS_ACCESS_KEY_ID=
@@ -17,10 +11,17 @@ Required .env variables:
   DYNAMODB_USERS_TABLE=fakeshield_users
   DYNAMODB_SEARCHES_TABLE=fakeshield_searches
   SNS_TOPIC_ARN=arn:aws:sns:ap-south-1:XXXX:FakeShieldAlerts
-  NUMVERIFY_API_KEY=64b1ebe2c88531cfdef4a71c318f3811
-  ABSTRACTAPI_EMAIL_KEY=0e6bb95788544355ad0c2366cc44ef77
+  MSG91_API_KEY=your_msg91_api_key
+  ZEROBOUNCE_API_KEY=your_zerobounce_api_key
+  ANTHROPIC_API_KEY=your_anthropic_api_key
   JWT_SECRET=your_super_secret_key_change_this
   PORT=5000
+
+Risk Score Bands:
+   0 – 25  → GREEN  (Safe)
+  25 – 50  → YELLOW (Low Risk)
+  50 – 75  → ORANGE (Medium Risk)
+  75 – 100 → RED    (High Risk / Danger)
 ──────────────────────────────────────────────────────────────────
 """
 
@@ -47,16 +48,34 @@ REPORTS_TABLE       = os.getenv("DYNAMODB_REPORTS_TABLE", "fakeshield_reports")
 USERS_TABLE         = os.getenv("DYNAMODB_USERS_TABLE",   "fakeshield_users")
 SEARCHES_TABLE      = os.getenv("DYNAMODB_SEARCHES_TABLE", "fakeshield_searches")
 SNS_TOPIC_ARN       = os.getenv("SNS_TOPIC_ARN", "")
-NUMVERIFY_API_KEY   = os.getenv("NUMVERIFY_API_KEY", "64b1ebe2c88531cfdef4a71c318f3811")
-ABSTRACTAPI_EMAIL_KEY = os.getenv("ABSTRACTAPI_EMAIL_KEY", "0e6bb95788544355ad0c2366cc44ef77")
+MSG91_API_KEY       = os.getenv("MSG91_API_KEY", "")
+ZEROBOUNCE_API_KEY  = os.getenv("ZEROBOUNCE_API_KEY", "")
+ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 JWT_SECRET          = os.getenv("JWT_SECRET", "changeme_secret")
 
-NUMVERIFY_BASE      = "http://apilayer.net/api/validate"  # HTTP only for free tier
-ABSTRACTAPI_BASE    = "https://emailvalidation.abstractapi.com/v1/"
+MSG91_BASE          = "https://api.msg91.com/api/v5/hlr-lookup"
+ZEROBOUNCE_BASE     = "https://api.zerobounce.net/v2/validate"
+
+# ── Risk score colour bands ──────────────────────────────────────
+#   0  – 25  : GREEN  (Safe)
+#  25  – 50  : YELLOW (Low Risk)
+#  50  – 75  : ORANGE (Medium Risk)
+#  75  – 100 : RED    (Danger)
+def risk_band(score: float) -> str:
+    if score < 25:
+        return "green"
+    elif score < 50:
+        return "yellow"
+    elif score < 75:
+        return "orange"
+    else:
+        return "danger"
 
 
 # ════════════════════════════════════════════════════════════════
 #  AWS CLIENTS
+#  On EC2 with IAM Role attached: boto3 picks credentials
+#  automatically — leave AWS_ACCESS_KEY_ID blank in that case.
 # ════════════════════════════════════════════════════════════════
 def _aws_kw():
     kw = {"region_name": AWS_REGION}
@@ -100,6 +119,7 @@ def _create_table_if_missing(name, key_schema, attr_defs, gsi=None):
 
 def init_dynamo():
     print("Initialising DynamoDB …")
+    # ── Reports: PK=identifier  SK=report_id ────────────────────
     _create_table_if_missing(
         REPORTS_TABLE,
         key_schema=[{"AttributeName": "identifier", "KeyType": "HASH"},
@@ -107,11 +127,13 @@ def init_dynamo():
         attr_defs=[{"AttributeName": "identifier", "AttributeType": "S"},
                    {"AttributeName": "report_id",  "AttributeType": "S"}],
     )
+    # ── Users: PK=email ─────────────────────────────────────────
     _create_table_if_missing(
         USERS_TABLE,
         key_schema=[{"AttributeName": "email", "KeyType": "HASH"}],
         attr_defs=[{"AttributeName": "email", "AttributeType": "S"}],
     )
+    # ── Searches: PK=search_id ──────────────────────────────────
     _create_table_if_missing(
         SEARCHES_TABLE,
         key_schema=[{"AttributeName": "search_id", "KeyType": "HASH"}],
@@ -120,7 +142,7 @@ def init_dynamo():
 
 
 # ════════════════════════════════════════════════════════════════
-#  JWT AUTH
+#  PURE-STDLIB JWT  (HS256 — no extra package)
 # ════════════════════════════════════════════════════════════════
 def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
@@ -209,6 +231,7 @@ def detect_id_type(v: str) -> str:
     """Detect if identifier is email or phone number"""
     if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v): 
         return "email"
+    # Remove common phone formatting characters
     clean = re.sub(r"[\s\-().+]", "", v)
     if re.match(r"^\d{7,15}$", clean):
         return "phone"
@@ -216,160 +239,240 @@ def detect_id_type(v: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════
-#  NUMVERIFY API
+#  MSG91 API (Phone Number Validation via HLR Lookup)
 # ════════════════════════════════════════════════════════════════
-def numverify_validate(phone: str) -> dict:
+def msg91_validate(phone: str) -> dict:
+    """
+    Validate phone number using MSG91 HLR Lookup API.
+    Docs: https://docs.msg91.com/reference/hlr-lookup
+    Returns: dict with validation results
+    """
     try:
         clean_phone = re.sub(r"[\s\-().+]", "", phone)
-        params = {"access_key": NUMVERIFY_API_KEY, "number": clean_phone, "format": 1}
-        response = requests.get(NUMVERIFY_BASE, params=params, timeout=10)
+        # Ensure E.164 format (add country code if missing)
+        if not clean_phone.startswith("+"):
+            clean_phone = "+" + clean_phone
+
+        headers = {
+            "authkey": MSG91_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload = {"number": clean_phone}
+
+        response = requests.post(MSG91_BASE, json=payload, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
-        if data.get("valid"):
+
+        # MSG91 HLR returns status field: "success" or error
+        if data.get("type") == "success" or data.get("status") == "1":
+            hlr = data.get("data", data)  # some versions wrap in "data"
             return {
                 "valid": True,
-                "number": data.get("number", ""),
-                "local_format": data.get("local_format", ""),
-                "international_format": data.get("international_format", ""),
-                "country_prefix": data.get("country_prefix", ""),
-                "country_code": data.get("country_code", ""),
-                "country_name": data.get("country_name", ""),
-                "location": data.get("location", ""),
-                "carrier": data.get("carrier", ""),
-                "line_type": data.get("line_type", "")
+                "number": clean_phone,
+                "international_format": hlr.get("international_format", clean_phone),
+                "local_format": hlr.get("local_format", ""),
+                "country_prefix": hlr.get("country_prefix", ""),
+                "country_code": hlr.get("country_code", ""),
+                "country_name": hlr.get("country_name", ""),
+                "location": hlr.get("location", ""),
+                "carrier": hlr.get("carrier", hlr.get("network", "")),
+                "line_type": hlr.get("line_type", hlr.get("type", "")),
+                "ported": hlr.get("ported", False),
+                "roaming": hlr.get("roaming", False),
             }
         else:
-            return {"valid": False, "error": data.get("error", {}).get("info", "Invalid phone number")}
+            return {
+                "valid": False,
+                "error": data.get("message", data.get("msg", "Invalid phone number"))
+            }
+
     except Exception as e:
-        print(f"[Numverify Error] {e}")
-        return {"valid": False, "error": f"API Error: {str(e)}"}
+        print(f"[MSG91 Error] {e}")
+        return {
+            "valid": False,
+            "error": f"API Error: {str(e)}"
+        }
 
 
 # ════════════════════════════════════════════════════════════════
-#  ABSTRACTAPI EMAIL VALIDATION
+#  ZEROBOUNCE EMAIL VALIDATION
+#  Docs: https://www.zerobounce.net/members/API
 # ════════════════════════════════════════════════════════════════
-def abstractapi_validate_email(email: str) -> dict:
+def zerobounce_validate_email(email: str) -> dict:
+    """
+    Validate email using ZeroBounce API.
+    Endpoint: GET https://api.zerobounce.net/v2/validate
+    Returns: dict with validation and quality results
+    """
     try:
-        params = {"api_key": ABSTRACTAPI_EMAIL_KEY, "email": email}
-        response = requests.get(ABSTRACTAPI_BASE, params=params, timeout=10)
+        params = {
+            "api_key": ZEROBOUNCE_API_KEY,
+            "email": email,
+            "ip_address": ""  # optional — leave blank
+        }
+
+        response = requests.get(ZEROBOUNCE_BASE, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
-        return {
-            "valid": data.get("is_valid_format", {}).get("value", False),
-            "deliverable": data.get("deliverability", "UNKNOWN"),
-            "quality_score": data.get("quality_score", 0),
-            "is_disposable": data.get("is_disposable_email", {}).get("value", False),
-            "is_free_email": data.get("is_free_email", {}).get("value", False),
-            "is_role_email": data.get("is_role_email", {}).get("value", False),
-            "is_catchall": data.get("is_catchall_email", {}).get("value", False),
-            "is_mx_found": data.get("is_mx_found", {}).get("value", False),
-            "is_smtp_valid": data.get("is_smtp_valid", {}).get("value", False),
-            "domain": data.get("domain", ""),
-            "smtp_provider": data.get("smtp_provider", "")
+
+        # ZeroBounce status values:
+        # valid, invalid, catch-all, unknown, spamtrap, abuse, do_not_mail
+        status       = data.get("status", "unknown").lower()
+        sub_status   = data.get("sub_status", "").lower()
+        deliverable  = status == "valid"
+        disposable   = sub_status in ("disposable", "role_based_catch_all")
+        role_based   = sub_status == "role_based"
+        free_email   = data.get("free_email", False)
+
+        # Derive quality_score (0.0 – 1.0) from ZeroBounce status
+        quality_map = {
+            "valid":       0.95,
+            "catch-all":   0.55,
+            "unknown":     0.40,
+            "spamtrap":    0.05,
+            "abuse":       0.05,
+            "do_not_mail": 0.05,
+            "invalid":     0.0,
         }
+        quality_score = quality_map.get(status, 0.3)
+        if sub_status == "disposable":
+            quality_score = min(quality_score, 0.1)
+
+        return {
+            "valid":        deliverable,
+            "status":       status,
+            "sub_status":   sub_status,
+            "deliverable":  "DELIVERABLE" if deliverable else "UNDELIVERABLE",
+            "quality_score": quality_score,
+            "is_disposable": disposable,
+            "is_free_email": free_email,
+            "is_role_email": role_based,
+            "is_catchall":  status == "catch-all",
+            "firstname":    data.get("firstname", ""),
+            "lastname":     data.get("lastname", ""),
+            "domain":       data.get("domain", ""),
+            "mx_found":     data.get("mx_found", ""),
+            "mx_record":    data.get("mx_record", ""),
+            "smtp_provider": data.get("smtp_provider", ""),
+            "did_you_mean": data.get("did_you_mean", ""),
+        }
+
     except Exception as e:
-        print(f"[AbstractAPI Error] {e}")
-        return {"valid": False, "error": f"API Error: {str(e)}"}
+        print(f"[ZeroBounce Error] {e}")
+        return {
+            "valid": False,
+            "error": f"API Error: {str(e)}"
+        }
 
 
 # ════════════════════════════════════════════════════════════════
-#  TRUST SCORE CALCULATION (INVERTED - 100=SAFE, 0=DANGER)
+#  CLAUDE AI ANALYSIS  (Anthropic claude-sonnet-4-20250514)
 # ════════════════════════════════════════════════════════════════
-def calculate_trust_score(scam_count: int, spam_count: int, genuine_count: int, total: int) -> float:
-    """Calculate trust score: 100=safe, 0=extreme danger"""
-    if total == 0:
-        return 50.0
-    
-    scam_weight = -50
-    spam_weight = -30
-    genuine_weight = 20
-    
-    weighted_score = ((scam_count * scam_weight) + (spam_count * spam_weight) + (genuine_count * genuine_weight)) / total
-    trust_score = 80 + weighted_score
-    return round(max(0, min(100, trust_score)), 2)
+def call_claude(prompt: str) -> str:
+    """Call Anthropic Claude API and return text response."""
+    if not ANTHROPIC_API_KEY:
+        return ""
+    try:
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers, json=payload, timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"[Claude API Error] {e}")
+        return ""
 
 
-def get_risk_level(trust_score: float) -> str:
-    """Convert trust score to risk level"""
-    if trust_score >= 70:
-        return "SAFE"
-    elif trust_score >= 40:
-        return "MEDIUM RISK"
-    elif trust_score >= 10:
-        return "DANGER"
-    else:
-        return "EXTREME DANGER"
-
-
-# ════════════════════════════════════════════════════════════════
-#  AI ANALYSIS
-# ════════════════════════════════════════════════════════════════
 def build_ai_analysis(identifier: str, stats: dict) -> dict:
-    scam = stats.get("scamCount", 0)
-    spam = stats.get("spamCount", 0)
+    """
+    Build analysis using MSG91 (phones) or ZeroBounce (emails) for
+    hard data, then call Claude for the narrative risk summary.
+    """
+    scam    = stats.get("scamCount", 0)
+    spam    = stats.get("spamCount", 0)
     genuine = stats.get("genuineCount", 0)
-    total = stats.get("totalReports", 0)
-    trust_score = stats.get("trustScore", 50)
+    total   = stats.get("totalReports", 0)
+    risk    = stats.get("riskScore", 0)
+    band    = risk_band(risk)
 
-    id_type = detect_id_type(identifier)
-    flags = []
+    id_type  = detect_id_type(identifier)
+    flags    = []
     api_data = {}
-    
+
+    # ── EMAIL ──────────────────────────────────────────────────
     if id_type == "email":
-        email_result = abstractapi_validate_email(identifier)
-        api_data = email_result
-        
-        if not email_result.get("valid", False):
-            flags.append({"label": "Invalid Email Format", "level": "danger"})
+        result   = zerobounce_validate_email(identifier)
+        api_data = result
+
+        if result.get("error"):
+            flags.append({"label": "Email validation unavailable", "level": "warning"})
         else:
-            quality = email_result.get("quality_score", 0)
-            if quality >= 0.8:
-                flags.append({"label": f"High Quality Email ({int(quality*100)}%)", "level": "safe"})
-            elif quality >= 0.5:
-                flags.append({"label": f"Medium Quality Email ({int(quality*100)}%)", "level": "warning"})
+            status  = result.get("status", "unknown")
+            quality = result.get("quality_score", 0)
+
+            if result.get("valid"):
+                flags.append({"label": f"Email Deliverable ({int(quality*100)}% quality)", "level": "safe"})
             else:
-                flags.append({"label": f"Low Quality Email ({int(quality*100)}%)", "level": "danger"})
-            
-            deliverable = email_result.get("deliverable", "UNKNOWN")
-            if deliverable == "DELIVERABLE":
-                flags.append({"label": "Email is Deliverable", "level": "safe"})
-            elif deliverable == "UNDELIVERABLE":
-                flags.append({"label": "Email Undeliverable", "level": "danger"})
-            
-            if email_result.get("is_disposable", False):
-                flags.append({"label": "Disposable Email Address", "level": "danger"})
-            if email_result.get("is_free_email", False):
-                flags.append({"label": "Free Email Provider", "level": "info"})
-            if email_result.get("is_role_email", False):
-                flags.append({"label": "Role-based Email", "level": "warning"})
-    
+                flags.append({"label": f"Email {status.upper()} – Not Deliverable", "level": "danger"})
+
+            if result.get("is_disposable"):
+                flags.append({"label": "Disposable / Temporary Email", "level": "danger"})
+            if result.get("is_catchall"):
+                flags.append({"label": "Catch-All Domain", "level": "warning"})
+            if result.get("is_role_email"):
+                flags.append({"label": "Role-Based Email (admin@, info@…)", "level": "warning"})
+            if result.get("is_free_email"):
+                flags.append({"label": "Free Email Provider", "level": "warning"})
+            if result.get("sub_status") in ("spamtrap", "abuse"):
+                flags.append({"label": f"Flagged: {result['sub_status'].upper()}", "level": "danger"})
+            if result.get("did_you_mean"):
+                flags.append({"label": f"Did you mean: {result['did_you_mean']}?", "level": "info"})
+
+    # ── PHONE ──────────────────────────────────────────────────
     elif id_type == "phone":
-        phone_result = numverify_validate(identifier)
-        api_data = phone_result
-        
-        if not phone_result.get("valid", False):
-            flags.append({"label": "Invalid Phone Number", "level": "danger"})
+        result   = msg91_validate(identifier)
+        api_data = result
+
+        if result.get("error"):
+            flags.append({"label": "Phone validation unavailable", "level": "warning"})
+        elif not result.get("valid"):
+            flags.append({"label": "Invalid / Unreachable Number", "level": "danger"})
         else:
-            country = phone_result.get("country_name", "Unknown")
-            carrier = phone_result.get("carrier", "Unknown")
-            line_type = phone_result.get("line_type", "Unknown")
-            
+            country   = result.get("country_name", "Unknown")
+            carrier   = result.get("carrier", "Unknown")
+            line_type = result.get("line_type", "")
+
             flags.append({"label": f"Valid {country} Number", "level": "safe"})
             if carrier and carrier != "Unknown":
                 flags.append({"label": f"Carrier: {carrier}", "level": "info"})
-            
             if line_type:
-                if line_type.lower() in ["mobile", "cell"]:
+                lt = line_type.lower()
+                if lt in ("mobile", "cell"):
                     flags.append({"label": "Mobile Number", "level": "safe"})
-                elif line_type.lower() in ["landline", "fixed"]:
+                elif lt in ("landline", "fixed"):
                     flags.append({"label": "Landline Number", "level": "info"})
-                elif line_type.lower() == "voip":
+                elif lt == "voip":
                     flags.append({"label": "VOIP Number", "level": "warning"})
+            if result.get("ported"):
+                flags.append({"label": "Number Has Been Ported", "level": "warning"})
+            if result.get("roaming"):
+                flags.append({"label": "Number Currently Roaming", "level": "info"})
     else:
         flags.append({"label": "Unknown Identifier Type", "level": "warning"})
 
+    # ── COMMUNITY REPORTS ──────────────────────────────────────
     if scam > 0:
         flags.append({"label": f"{scam} Scam Report(s)", "level": "danger"})
     if spam > 0:
@@ -377,61 +480,75 @@ def build_ai_analysis(identifier: str, stats: dict) -> dict:
     if genuine > 0:
         flags.append({"label": f"{genuine} Genuine Report(s)", "level": "safe"})
 
-    verdict = get_risk_level(trust_score)
+    # ── RISK VERDICT ───────────────────────────────────────────
+    verdict_map = {
+        "green":  "SAFE",
+        "yellow": "LOW RISK",
+        "orange": "MEDIUM RISK",
+        "danger": "HIGH RISK",
+    }
+    verdict = verdict_map[band]
 
-    if id_type == "email":
-        quality = api_data.get("quality_score", 0)
-        deliverable = api_data.get("deliverable", "UNKNOWN")
-        summary = f"{verdict}. Quality: {int(quality*100)}%. Deliverable: {deliverable}. Reports: {total}."
-    elif id_type == "phone":
-        valid = "Valid" if api_data.get("valid", False) else "Invalid"
-        country = api_data.get("country_name", "Unknown")
-        summary = f"{verdict}. {valid} {country} number. Reports: {total}."
-    else:
-        summary = f"{verdict}. Unknown type. Reports: {total}."
+    # ── CLAUDE NARRATIVE ───────────────────────────────────────
+    ai_summary = ""
+    if ANTHROPIC_API_KEY:
+        flag_labels = ", ".join(f["label"] for f in flags) or "none"
+        prompt = (
+            f"You are a fraud-detection assistant. Analyse this identifier in 2-3 concise sentences.\n"
+            f"Identifier : {identifier}\n"
+            f"Type       : {id_type}\n"
+            f"Risk score : {risk}/100 ({verdict})\n"
+            f"Risk band  : {band}\n"
+            f"Reports    : {scam} scam, {spam} spam, {genuine} genuine (total {total})\n"
+            f"Signals    : {flag_labels}\n"
+            f"Provide a plain-English risk summary and advice for the recipient."
+        )
+        ai_summary = call_claude(prompt)
+
+    if not ai_summary:
+        # Fallback deterministic summary
+        if id_type == "email":
+            q = int(api_data.get("quality_score", 0) * 100)
+            d = api_data.get("deliverable", "UNKNOWN")
+            ai_summary = f"{verdict}. Email quality: {q}%. Deliverability: {d}. Community reports: {total}."
+        elif id_type == "phone":
+            v = "Valid" if api_data.get("valid") else "Invalid"
+            c = api_data.get("country_name", "Unknown")
+            ai_summary = f"{verdict}. {v} {c} number. Community reports: {total}."
+        else:
+            ai_summary = f"{verdict}. Unknown identifier. Community reports: {total}."
 
     return {
-        "verdict": verdict,
-        "summary": summary,
-        "flags": flags[:8],
-        "identifierType": id_type,
-        "apiData": api_data,
-        "analysisSource": "Numverify" if id_type == "phone" else ("AbstractAPI" if id_type == "email" else "None")
+        "verdict":          verdict,
+        "riskBand":         band,
+        "summary":          ai_summary,
+        "flags":            flags[:8],
+        "identifierType":   id_type,
+        "apiData":          api_data,
+        "analysisSource":   (
+            "MSG91" if id_type == "phone"
+            else ("ZeroBounce" if id_type == "email" else "None")
+        ),
+        "aiNarrative":      bool(ai_summary and ANTHROPIC_API_KEY),
     }
-
-
 # ════════════════════════════════════════════════════════════════
 #  SEARCH TRACKING
 # ════════════════════════════════════════════════════════════════
-def db_log_search(identifier: str, trust_score: float, user_email: str = None, api_result: dict = None):
+def db_log_search(identifier: str, user_email: str = None):
+    """Log search/lookup activity to DynamoDB"""
     try:
         search_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
-        id_type = detect_id_type(identifier)
         
         item = {
             "search_id": search_id,
             "identifier": identifier,
             "searched_by": user_email or "anonymous",
             "searched_at": timestamp,
-            "id_type": id_type,
-            "trust_score": trust_score,
-            "risk_level": get_risk_level(trust_score)
+            "id_type": detect_id_type(identifier)
         }
         
-        if api_result:
-            if id_type == "email":
-                item["email_quality"] = api_result.get("quality_score", 0)
-                item["deliverable"] = api_result.get("deliverable", "UNKNOWN")
-                item["is_disposable"] = api_result.get("is_disposable", False)
-            elif id_type == "phone":
-                item["phone_valid"] = api_result.get("valid", False)
-                item["country"] = api_result.get("country_name", "Unknown")
-                item["carrier"] = api_result.get("carrier", "Unknown")
-                item["line_type"] = api_result.get("line_type", "Unknown")
-        
         searches_table.put_item(Item=item)
-        print(f"✓ Search logged: {identifier} (Trust: {trust_score})")
         return item
     except Exception as e:
         print(f"[Search Log Error] {e}")
@@ -439,67 +556,58 @@ def db_log_search(identifier: str, trust_score: float, user_email: str = None, a
 
 
 # ════════════════════════════════════════════════════════════════
-#  CRUD OPERATIONS
+#  DYNAMODB CRUD
 # ════════════════════════════════════════════════════════════════
+def _risk(sc, sp, ge, tot):
+    if not tot: return 0
+    return round(max(0, min(100, ((sc*50)+(sp*30)+(ge*-20))/tot)), 2)
+
 def db_create_report(identifier, rtype, message, user_email=None):
     rid = str(uuid.uuid4())
-    ts = datetime.now(timezone.utc).isoformat()
-    item = {"identifier": identifier, "report_id": rid, "type": rtype, "message": message, 
-            "created_at": ts, "reported_by": user_email or "anonymous"}
+    ts  = datetime.now(timezone.utc).isoformat()
+    item = {"identifier": identifier, "report_id": rid, "type": rtype,
+            "message": message, "created_at": ts,
+            "reported_by": user_email or "anonymous"}
     reports_table.put_item(Item=item)
     if rtype == "Scam":
-        sns_notify(f"[FakeShield] SCAM: {identifier}", 
-                   f"ID: {identifier}\nBy: {user_email or 'anon'}\nMsg: {message}")
+        sns_notify(f"[FakeShield] SCAM reported: {identifier}",
+                   f"Identifier : {identifier}\nReporter   : {user_email or 'anon'}\nTime       : {ts}\nDetails    : {message}")
     return {**item, "tagType": rtype, "createdAt": ts}
 
-
 def db_stats(identifier):
-    items = reports_table.query(KeyConditionExpression=Key("identifier").eq(identifier)).get("Items", [])
-    sc = sum(1 for r in items if r.get("type", "").lower() == "scam")
-    sp = sum(1 for r in items if r.get("type", "").lower() == "spam")
-    ge = sum(1 for r in items if r.get("type", "").lower() == "genuine")
+    items = reports_table.query(
+        KeyConditionExpression=Key("identifier").eq(identifier)).get("Items", [])
+    sc = sum(1 for r in items if r.get("type","").lower()=="scam")
+    sp = sum(1 for r in items if r.get("type","").lower()=="spam")
+    ge = sum(1 for r in items if r.get("type","").lower()=="genuine")
     tot = len(items)
-    trust_score = calculate_trust_score(sc, sp, ge, tot)
-    
-    reports = sorted([
-        {"id": r.get("report_id"), "identifier": r.get("identifier"), "tagType": r.get("type"),
-         "message": r.get("message"), "createdAt": r.get("created_at"), "reportedBy": r.get("reported_by")}
-        for r in items
-    ], key=lambda x: x.get("createdAt", ""), reverse=True)
-    
-    return {
-        "identifier": identifier,
-        "totalReports": tot,
-        "scamCount": sc,
-        "spamCount": sp,
-        "genuineCount": ge,
-        "trustScore": trust_score,
-        "riskScore": trust_score,
-        "scamScore": 100 - trust_score,
-        "riskLevel": get_risk_level(trust_score),
-        "tags": list(set(r.get("type", "") for r in items)),
-        "reports": reports
-    }
-
+    risk = _risk(sc, sp, ge, tot)
+    reports = sorted([{"id":r.get("report_id"),"identifier":r.get("identifier"),
+                       "tagType":r.get("type"),"message":r.get("message"),
+                       "createdAt":r.get("created_at"),"reportedBy":r.get("reported_by")} for r in items],
+                     key=lambda x:x.get("createdAt",""), reverse=True)
+    return {"identifier":identifier,"totalReports":tot,"scamCount":sc,"spamCount":sp,
+            "genuineCount":ge,"riskScore":risk,"scamScore":risk,"riskBand":risk_band(risk),
+            "tags":list(set(r.get("type","") for r in items)),"reports":reports}
 
 def db_all_reports(limit=100):
-    resp = reports_table.scan(Limit=min(limit, 1000))
+    resp  = reports_table.scan(Limit=min(limit, 1000))
     items = resp.get("Items", [])
-    return sorted([
-        {"id": r.get("report_id"), "identifier": r.get("identifier"), "tagType": r.get("type"),
-         "message": r.get("message"), "createdAt": r.get("created_at"), "reportedBy": r.get("reported_by")}
-        for r in items
-    ], key=lambda x: x.get("createdAt", ""), reverse=True)[:limit]
-
+    return sorted([{"id":r.get("report_id"),"identifier":r.get("identifier"),
+                    "tagType":r.get("type"),"message":r.get("message"),
+                    "createdAt":r.get("created_at"),"reportedBy":r.get("reported_by")} for r in items],
+                  key=lambda x:x.get("createdAt",""), reverse=True)[:limit]
 
 def db_dashboard():
-    items = reports_table.scan(ProjectionExpression="#t", ExpressionAttributeNames={"#t": "type"}).get("Items", [])
-    total = len(items)
-    sc = sum(1 for r in items if r.get("type") == "Scam")
-    sp = sum(1 for r in items if r.get("type") == "Spam")
-    ge = sum(1 for r in items if r.get("type") == "Genuine")
-    ids = len(set(r.get("identifier", "") for r in reports_table.scan(ProjectionExpression="identifier").get("Items", [])))
-    return {"totalReports": total, "scamCount": sc, "spamCount": sp, "genuineCount": ge, "uniqueIdentifiers": ids}
+    items   = reports_table.scan(ProjectionExpression="#t",
+                                  ExpressionAttributeNames={"#t":"type"}).get("Items",[])
+    total   = len(items)
+    sc = sum(1 for r in items if r.get("type")=="Scam")
+    sp = sum(1 for r in items if r.get("type")=="Spam")
+    ge = sum(1 for r in items if r.get("type")=="Genuine")
+    ids = len(set(r.get("identifier","") for r in
+                  reports_table.scan(ProjectionExpression="identifier").get("Items",[])))
+    return {"totalReports":total,"scamCount":sc,"spamCount":sp,"genuineCount":ge,"uniqueIdentifiers":ids}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -508,44 +616,39 @@ def db_dashboard():
 @app.route("/api/auth/register", methods=["POST"])
 def register():
     d = request.get_json() or {}
-    email = d.get("email", "").strip().lower()
-    password = d.get("password", "")
-    name = d.get("name", "").strip()
-    
+    email    = d.get("email","").strip().lower()
+    password = d.get("password","")
+    name     = d.get("name","").strip()
     if not email or not password:
-        return jsonify({"error": "Email and password required"}), 400
+        return jsonify({"error":"Email and password required"}), 400
     if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-        return jsonify({"error": "Invalid email"}), 400
+        return jsonify({"error":"Invalid email"}), 400
     if len(password) < 6:
-        return jsonify({"error": "Password must be ≥ 6 characters"}), 400
-    if users_table.get_item(Key={"email": email}).get("Item"):
-        return jsonify({"error": "Email already registered"}), 409
-    
-    ts = datetime.now(timezone.utc).isoformat()
+        return jsonify({"error":"Password must be ≥ 6 characters"}), 400
+    if users_table.get_item(Key={"email":email}).get("Item"):
+        return jsonify({"error":"Email already registered"}), 409
+    ts   = datetime.now(timezone.utc).isoformat()
     uname = name or email.split("@")[0]
-    users_table.put_item(Item={"email": email, "name": uname, "password": hash_pw(password), 
-                                "created_at": ts, "role": "user"})
+    users_table.put_item(Item={"email":email,"name":uname,
+                               "password":hash_pw(password),"created_at":ts,"role":"user"})
     sns_notify("[FakeShield] New user", f"Email: {email}\nTime: {ts}")
-    token = jwt_encode({"email": email, "name": uname, "role": "user"})
-    return jsonify({"success": True, "token": token, "user": {"email": email, "name": uname, "role": "user"}}), 201
+    token = jwt_encode({"email":email,"name":uname,"role":"user"})
+    return jsonify({"success":True,"token":token,"user":{"email":email,"name":uname,"role":"user"}}), 201
 
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
-    d = request.get_json() or {}
-    email = d.get("email", "").strip().lower()
-    pw = d.get("password", "")
-    
+    d     = request.get_json() or {}
+    email = d.get("email","").strip().lower()
+    pw    = d.get("password","")
     if not email or not pw:
-        return jsonify({"error": "Email and password required"}), 400
-    
-    item = users_table.get_item(Key={"email": email}).get("Item")
-    if not item or not verify_pw(pw, item.get("password", "")):
-        return jsonify({"error": "Invalid email or password"}), 401
-    
-    token = jwt_encode({"email": email, "name": item.get("name", ""), "role": item.get("role", "user")})
-    return jsonify({"success": True, "token": token, 
-                    "user": {"email": email, "name": item.get("name", ""), "role": item.get("role", "user")}}), 200
+        return jsonify({"error":"Email and password required"}), 400
+    item = users_table.get_item(Key={"email":email}).get("Item")
+    if not item or not verify_pw(pw, item.get("password","")):
+        return jsonify({"error":"Invalid email or password"}), 401
+    token = jwt_encode({"email":email,"name":item.get("name",""),"role":item.get("role","user")})
+    return jsonify({"success":True,"token":token,
+                    "user":{"email":email,"name":item.get("name",""),"role":item.get("role","user")}}), 200
 
 
 @app.route("/api/auth/me", methods=["GET"])
@@ -559,177 +662,100 @@ def me():
 # ════════════════════════════════════════════════════════════════
 @app.route("/")
 def home():
-    return jsonify({
-        "status": "running",
-        "service": "FakeShield API v3.2",
-        "riskScale": "100-70=SAFE | 70-40=MEDIUM | 40-10=DANGER | 10-0=EXTREME",
-        "numverify": bool(NUMVERIFY_API_KEY),
-        "abstractapi": bool(ABSTRACTAPI_EMAIL_KEY),
-        "sns": bool(SNS_TOPIC_ARN)
-    })
-
+    return jsonify({"status":"running","service":"FakeShield API v3.2",
+                    "msg91":bool(MSG91_API_KEY),"zerobounce":bool(ZEROBOUNCE_API_KEY),"claude":bool(ANTHROPIC_API_KEY),
+                    "sns":bool(SNS_TOPIC_ARN)})
 
 @app.route("/api/report", methods=["POST"])
 @optional_auth
 def submit_report():
     try:
-        d = request.get_json() or {}
-        identifier = d.get("identifier", "").strip()
-        rtype = d.get("tagType", d.get("type", "")).strip()
-        message = d.get("message", "").strip()
+        d          = request.get_json() or {}
+        identifier = d.get("identifier","").strip()
+        rtype      = d.get("tagType", d.get("type","")).strip()
+        message    = d.get("message","").strip()
         user_email = g.user["email"] if g.user else None
-        
-        if not identifier:
-            return jsonify({"error": "Identifier required"}), 400
-        if rtype not in ["Scam", "Spam", "Genuine"]:
-            return jsonify({"error": "type must be Scam/Spam/Genuine"}), 400
-        if not message:
-            return jsonify({"error": "Message required"}), 400
-        
+        if not identifier: return jsonify({"error":"Identifier required"}), 400
+        if rtype not in ["Scam","Spam","Genuine"]: return jsonify({"error":"type must be Scam/Spam/Genuine"}), 400
+        if not message: return jsonify({"error":"Message required"}), 400
         report = db_create_report(identifier, rtype, message, user_email)
-        stats = db_stats(identifier)
-        
-        return jsonify({
-            "success": True,
-            "message": "Report submitted",
-            "currentTrustScore": stats["trustScore"],
-            "currentRiskScore": stats["trustScore"],
-            "riskLevel": stats["riskLevel"],
-            "report": report
-        }), 201
+        stats  = db_stats(identifier)
+        return jsonify({"success":True,"message":"Report submitted",
+                        "currentRiskScore":stats["riskScore"],"report":report}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/api/lookup/<path:identifier>", methods=["GET"])
 @optional_auth
 def lookup(identifier):
     try:
+        # Log the search
         user_email = g.user["email"] if g.user else None
+        db_log_search(identifier, user_email)
+        
+        # Get stats
         s = db_stats(identifier)
         
-        ai_analysis = None
-        api_data = None
+        # Build AI analysis (unless disabled)
+        if request.args.get("ai","true").lower() != "false":
+            s["aiAnalysis"] = build_ai_analysis(identifier, s)
         
-        if request.args.get("ai", "true").lower() != "false":
-            ai_analysis = build_ai_analysis(identifier, s)
-            s["aiAnalysis"] = ai_analysis
-            api_data = ai_analysis.get("apiData", {})
-        
+        # If no reports, calculate risk from API validation
         if s["totalReports"] == 0:
             id_type = detect_id_type(identifier)
-            
             if id_type == "email":
-                email_data = abstractapi_validate_email(identifier)
-                api_data = email_data
+                email_data = zerobounce_validate_email(identifier)
                 quality = email_data.get("quality_score", 0.5)
-                trust_score = round(20 + (quality * 70), 2)
-                
-                if email_data.get("is_disposable", False):
-                    trust_score = max(10, trust_score - 40)
-                if not email_data.get("valid", False):
-                    trust_score = max(5, trust_score - 50)
-                
-                s["trustScore"] = trust_score
-                s["riskScore"] = trust_score
-                s["riskLevel"] = get_risk_level(trust_score)
-                
+                # Convert quality to risk (inverse relationship)
+                s["riskScore"] = round((1 - quality) * 50)  # 0-50 range for no reports
             elif id_type == "phone":
-                phone_data = numverify_validate(identifier)
-                api_data = phone_data
-                
+                phone_data = msg91_validate(identifier)
                 if not phone_data.get("valid", False):
-                    trust_score = 20
+                    s["riskScore"] = 40  # Invalid number = medium risk
                 else:
-                    line_type = phone_data.get("line_type", "").lower()
-                    if line_type in ["mobile", "cell"]:
-                        trust_score = 75
-                    elif line_type == "voip":
-                        trust_score = 45
-                    else:
-                        trust_score = 60
-                
-                s["trustScore"] = trust_score
-                s["riskScore"] = trust_score
-                s["riskLevel"] = get_risk_level(trust_score)
-            else:
-                s["trustScore"] = 50
-                s["riskScore"] = 50
-                s["riskLevel"] = "MEDIUM RISK"
-            
+                    s["riskScore"] = 10  # Valid number, no reports = low risk
             s["message"] = "API validation analysis (no community reports)"
-        
-        db_log_search(identifier=identifier, trust_score=s["trustScore"], 
-                      user_email=user_email, api_result=api_data)
         
         return jsonify(s), 200
     except Exception as e:
-        print(f"[Lookup Error] {e}")
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/api/reports", methods=["GET"])
 def get_reports():
     try:
-        return jsonify(db_all_reports(request.args.get("limit", 100, type=int))), 200
+        return jsonify(db_all_reports(request.args.get("limit",100,type=int))), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        return jsonify({"error":str(e)}), 500
 
 @app.route("/api/stats", methods=["GET"])
 def get_stats():
-    try:
-        return jsonify(db_dashboard()), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+    try: return jsonify(db_dashboard()), 200
+    except Exception as e: return jsonify({"error":str(e)}), 500
 
 @app.route("/api/reports/<path:identifier>", methods=["GET"])
 def id_reports(identifier):
-    try:
-        return jsonify(db_stats(identifier)["reports"]), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/searches", methods=["GET"])
-@optional_auth
-def get_searches():
-    try:
-        limit = request.args.get("limit", 50, type=int)
-        resp = searches_table.scan(Limit=min(limit, 1000))
-        items = resp.get("Items", [])
-        searches = sorted(items, key=lambda x: x.get("searched_at", ""), reverse=True)[:limit]
-        return jsonify(searches), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+    try: return jsonify(db_stats(identifier)["reports"]), 200
+    except Exception as e: return jsonify({"error":str(e)}), 500
 
 @app.errorhandler(404)
-def not_found(_):
-    return jsonify({"error": "Not found"}), 404
-
+def nf(_): return jsonify({"error":"Not found"}), 404
 
 @app.errorhandler(500)
-def internal_error(_):
-    return jsonify({"error": "Server error"}), 500
+def ie(_): return jsonify({"error":"Server error"}), 500
 
 
 if __name__ == "__main__":
     init_dynamo()
-    port = int(os.getenv("PORT", 5000))
-    debug = os.getenv("DEBUG", "False") == "True"
-    
-    print(f"\n{'═'*70}")
-    print(f"  FakeShield API v3.2 - Inverted Risk Score Edition")
-    print(f"  {'─'*68}")
-    print(f"  Risk Scale  : 100-70=SAFE | 70-40=MEDIUM | 40-10=DANGER | 10-0=EXTREME")
+    port  = int(os.getenv("PORT", 5000))
+    debug = os.getenv("DEBUG","False") == "True"
+    print(f"\n{'═'*60}")
+    print(f"  FakeShield API v3.2")
     print(f"  Region      : {AWS_REGION}")
     print(f"  DynamoDB    : {REPORTS_TABLE} / {USERS_TABLE} / {SEARCHES_TABLE}")
     print(f"  SNS         : {SNS_TOPIC_ARN or '✗ not set'}")
-    print(f"  Numverify   : {'✓' if NUMVERIFY_API_KEY else '✗ not set'}")
-    print(f"  AbstractAPI : {'✓' if ABSTRACTAPI_EMAIL_KEY else '✗ not set'}")
+    print(f"  MSG91       : {'✓' if MSG91_API_KEY else '✗ not set'}")
+    print(f"  ZeroBounce  : {'✓' if ZEROBOUNCE_API_KEY else '✗ not set'}")
+    print(f"  Claude AI   : {'✓' if ANTHROPIC_API_KEY else '✗ not set'}")
     print(f"  JWT         : {'⚠ default!' if JWT_SECRET=='changeme_secret' else '✓'}")
-    print(f"{'═'*70}\n")
-    
+    print(f"{'═'*60}\n")
     app.run(host="0.0.0.0", port=port, debug=debug)
